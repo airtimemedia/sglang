@@ -798,6 +798,16 @@ class MiniMaxH3ComfyUIStepStage(PipelineStage):
             existing = None
 
         def _factory() -> MiniMaxH3ComfyUIRunState:
+            subblock_query_block_size = None
+            if server_args.pipeline_config.uses_subblock_attention(server_args):
+                from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (
+                    SubBlockSparseSchedule,
+                )
+
+                # The query-block mask must be cut in the backend's own block width.
+                subblock_query_block_size = (
+                    SubBlockSparseSchedule.from_server_args().block_size
+                )
             branch = MiniMaxH3DenoiseBranch(
                 packed=inputs["packed"],
                 text_embeddings=inputs["text_embeddings"],
@@ -806,6 +816,7 @@ class MiniMaxH3ComfyUIStepStage(PipelineStage):
                 video_query_indices=inputs["packed"]["img_pos"][
                     inputs["packed"]["update_mask"]
                 ],
+                subblock_query_block_size=subblock_query_block_size,
             )
             return MiniMaxH3ComfyUIRunState(
                 branch=branch,

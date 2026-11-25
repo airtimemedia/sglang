@@ -67,8 +67,9 @@ def _minimax_h3_subblock_sparse_query_block_mask(
     video_query_indices: torch.Tensor,
     *,
     used_len: int,
+    block_size: int = _MINIMAX_H3_SUBBLOCK_QUERY_BLOCK_SIZE,
 ) -> torch.Tensor:
-    """Return True for pure-video 64-row Q blocks and False otherwise."""
+    """Return True for pure-video ``block_size``-row Q blocks and False otherwise."""
     if used_len < 0:
         raise ValueError(f"used_len must be non-negative, got {used_len}")
     if video_query_indices.ndim != 1:
@@ -86,7 +87,6 @@ def _minimax_h3_subblock_sparse_query_block_mask(
             )
         if torch.unique(video_query_indices).numel() != video_query_indices.numel():
             raise ValueError("video_query_indices must not contain duplicates")
-    block_size = _MINIMAX_H3_SUBBLOCK_QUERY_BLOCK_SIZE
     num_query_blocks = -(-used_len // block_size)
     video_rows_per_block = torch.bincount(
         torch.div(video_query_indices, block_size, rounding_mode="floor"),
@@ -203,7 +203,8 @@ class MiniMaxH3DenoiseBranch:
     dict); `text_embeddings` is the branch's [text_len, 5120] hidden states;
     `token_tags` must already carry any fl2va vision-span overrides, and
     `video_query_indices` explicitly identifies the only rows eligible for
-    SubBlock sparsity.
+    SubBlock sparsity, and `subblock_query_block_size` must equal the SubBlock
+    backend's configured `block_size` (None: its 64-row default).
     """
 
     def __init__(
@@ -214,6 +215,7 @@ class MiniMaxH3DenoiseBranch:
         token_tags: torch.Tensor,
         device: torch.device,
         video_query_indices: torch.Tensor | None = None,
+        subblock_query_block_size: int | None = None,
     ) -> None:
         seq_len = int(packed["seq_len"])
         self.seq_len = seq_len
@@ -296,6 +298,11 @@ class MiniMaxH3DenoiseBranch:
             _minimax_h3_subblock_sparse_query_block_mask(
                 video_query_indices.view(-1).to(dtype=torch.long),
                 used_len=int(cu[1]),
+                block_size=(
+                    _MINIMAX_H3_SUBBLOCK_QUERY_BLOCK_SIZE
+                    if subblock_query_block_size is None
+                    else subblock_query_block_size
+                ),
             ).to(device)
             if video_query_indices is not None
             else None

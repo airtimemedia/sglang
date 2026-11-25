@@ -95,6 +95,12 @@ rejected.
 | `skip_first_layers` | 0 | leading DiT blocks kept dense |
 | `min_seq_len` | 4096 | shorter sequences run dense |
 | `compute_mode` | `"bf16"` | compute path: `"bf16"` or architecture-dispatched `"sage_fp8"` |
+| `block_size` | 64 | Q/K rows per routed block: 64, or 128 on SM90 `bf16` only |
+
+`block_size=128` runs the SM90 CuTe kernel at its native 128x128 tile, for a
+checkpoint trained with Q128 x K128 block-sparse attention. `n_q` and `n_k`
+split whatever block is configured, so `n_q = n_k = 4` then pools 32-token
+cells. SM100, SM120 and `sage_fp8` reject it.
 
 `compute_mode="sage_fp8"` is the stable public name, not a promise that every
 architecture quantizes every operand identically. On SM90 it calls

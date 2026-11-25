@@ -17,6 +17,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
 from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (
     SubBlockSparseAttentionImpl,
     _get_subblock_sparse_attention_runner,
+    _run_subblock_sparse_attention,
     _sage_key_block_size,
     _sm90_sage_fp8_sparse_attention,
     _sm90_sparse_attention,
@@ -179,6 +180,25 @@ class TestSubBlockSparseAttentionDispatch(CustomTestCase):
             runner = _get_subblock_sparse_attention_runner(device)
 
         self.assertIs(runner, _sm120_sparse_attention)
+
+    def test_block_size_128_is_served_by_the_sm90_bf16_kernel_only(self):
+        """The blk64 and Sage kernels would read a 128-row plan as 64-row blocks."""
+        q = torch.zeros(1, 256, 1, 128, dtype=torch.bfloat16)
+        index = torch.zeros(1, 1, 2, 1, dtype=torch.int32)
+        for capability, compute_mode in (
+            ((10, 0), "bf16"),
+            ((12, 0), "bf16"),
+            ((9, 0), "sage_fp8"),
+        ):
+            _get_subblock_sparse_attention_runner.cache_clear()
+            with (
+                self.subTest(capability=capability, compute_mode=compute_mode),
+                patch("torch.cuda.get_device_capability", return_value=capability),
+                self.assertRaisesRegex(RuntimeError, "only served by the SM90 BF16"),
+            ):
+                _run_subblock_sparse_attention(
+                    q, q, q, index, 1, 128**-0.5, None, compute_mode, 128
+                )
 
     def test_sm120_sage_dispatch_and_block_geometry(self):
         with (
@@ -727,11 +747,25 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
             torch.tensor([True, False, True]),
         )
 
+    def test_query_mask_follows_the_backend_block_size(self):
+        """The same rows cut in 128-row blocks: the first block is now mixed."""
+        sparse_query_block_mask = _minimax_h3_subblock_sparse_query_block_mask(
+            torch.cat([torch.arange(64), torch.arange(128, 140)]),
+            used_len=140,
+            block_size=128,
+        )
+        torch.testing.assert_close(
+            sparse_query_block_mask,
+            torch.tensor([False, True]),
+        )
+
     def test_hybrid_query_routing_uses_one_heterogeneous_bsa_call(self):
         impl = object.__new__(SubBlockSparseAttentionImpl)
         impl.softmax_scale = 2**-0.5
         impl.causal = False
-        impl.schedule = SimpleNamespace(sparsity=0.75, compute_mode="bf16")
+        impl.schedule = SimpleNamespace(
+            sparsity=0.75, compute_mode="bf16", block_size=64
+        )
         plan = SimpleNamespace(
             index=torch.tensor(
                 [[[[7, 1, 4], [6, 2, 0], [5, 0, 3]]]], dtype=torch.int32

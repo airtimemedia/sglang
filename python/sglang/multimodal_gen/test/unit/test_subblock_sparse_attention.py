@@ -166,6 +166,7 @@ class TestSubBlockSparseSchedule(unittest.TestCase):
         self.assertEqual(schedule.n_k, 4)
         self.assertEqual(schedule.n_q, 4)
         self.assertEqual(schedule.compute_mode, "bf16")
+        self.assertEqual(schedule.block_size, 64)
 
     def test_sage_fp8_uses_16_token_key_subblocks_by_default(self):
         for capability, expected_n_k in (((9, 0), 8), ((12, 0), 4)):
@@ -189,6 +190,9 @@ class TestSubBlockSparseSchedule(unittest.TestCase):
             {"n_k": 3},
             {"skip_first_steps": -1},
             {"compute_mode": "fp8"},
+            {"block_size": 96},
+            # the Sage kernels fix the query block at 64 rows
+            {"block_size": 128, "compute_mode": "sage_fp8"},
         ):
             with self.subTest(config=config), _patch_schedule(config):
                 with self.assertRaises(ValueError):
@@ -340,6 +344,12 @@ class TestSubBlockGating(unittest.TestCase):
                 self.assertEqual(impl.router.block_size_k // impl.router.n_k, 16)
                 self.assertEqual(impl.router.budget_granularity, 1)
 
+    def test_block_size_128_routes_q128_k128(self):
+        """The router must score in the same blocks the kernel is handed."""
+        impl = self._impl("blocks.9.attn", block_size=128)
+        self.assertEqual(impl.router.block_size_q, 128)
+        self.assertEqual(impl.router.block_size_k, 128)
+
 
 @requires_subblock_kernel
 class TestSubBlockNumerics(unittest.TestCase):
@@ -374,6 +384,18 @@ class TestSubBlockNumerics(unittest.TestCase):
         seq_len = self.seq_len + 37
         q, k, v = _structured_qkv(seq_len, device)
         impl = self._impl(sparsity=1e-6)
+        with _patch_step(20):
+            out = impl.forward(q, k, v, None)
+        ref = _dense_reference(q, k, v, HEAD_DIM**-0.5)
+        self.assertGreater(_cosine(out, ref), 0.999)
+
+    def test_sm90_block_128_ragged_tail_reproduces_dense(self):
+        """Q128 x K128 on the SM90 kernel, with a tail shorter than one block."""
+        if torch.cuda.get_device_capability() != (9, 0):
+            self.skipTest("block_size=128 is specific to the SM90 BF16 kernel")
+        device = torch.device("cuda")
+        q, k, v = _structured_qkv(self.seq_len + 37, device)
+        impl = self._impl(sparsity=1e-6, block_size=128)
         with _patch_step(20):
             out = impl.forward(q, k, v, None)
         ref = _dense_reference(q, k, v, HEAD_DIM**-0.5)
@@ -454,13 +476,13 @@ class TestSubBlockNumerics(unittest.TestCase):
         )
         self.assertLess(_cosine(random_out, ref), 0.9)
 
-    def _assert_kernel_backed_mixed_query_mask(self):
+    def _assert_kernel_backed_mixed_query_mask(self, block_size: int = 64):
         device = torch.device("cuda")
         scale = HEAD_DIM**-0.5
         generator = torch.Generator(device=device).manual_seed(7)
         q = torch.randn(
             1,
-            3 * 64,
+            3 * block_size,
             NUM_HEADS,
             HEAD_DIM,
             device=device,
@@ -469,7 +491,7 @@ class TestSubBlockNumerics(unittest.TestCase):
         )
         k = torch.randn(
             1,
-            16 * 64,
+            16 * block_size,
             NUM_HEADS,
             HEAD_DIM,
             device=device,
@@ -502,7 +524,7 @@ class TestSubBlockNumerics(unittest.TestCase):
             num_blocks=16,
             density=0.5,
         )
-        impl = self._impl(sparsity=0.5)
+        impl = self._impl(sparsity=0.5, block_size=block_size)
         impl.router = Mock(route=Mock(return_value=plan))
         sparse_query_block_mask = torch.tensor([True, False, True], device=device)
 
@@ -515,7 +537,7 @@ class TestSubBlockNumerics(unittest.TestCase):
 
         reference = torch.empty_like(q)
         all_blocks = torch.arange(16, device=device)
-        token_offsets = torch.arange(64, device=device)
+        token_offsets = torch.arange(block_size, device=device)
         for query_block in range(3):
             selected_blocks = (
                 sparse_blocks[query_block].long()
@@ -523,9 +545,11 @@ class TestSubBlockNumerics(unittest.TestCase):
                 else all_blocks
             )
             selected_tokens = (
-                selected_blocks[:, None] * 64 + token_offsets[None, :]
+                selected_blocks[:, None] * block_size + token_offsets[None, :]
             ).reshape(-1)
-            query_slice = slice(query_block * 64, (query_block + 1) * 64)
+            query_slice = slice(
+                query_block * block_size, (query_block + 1) * block_size
+            )
             reference[:, query_slice] = _dense_reference(
                 q[:, query_slice],
                 k.index_select(1, selected_tokens),
@@ -539,6 +563,11 @@ class TestSubBlockNumerics(unittest.TestCase):
         if torch.cuda.get_device_capability() != (9, 0):
             self.skipTest("requires the SM90 SubBlock kernel")
         self._assert_kernel_backed_mixed_query_mask()
+
+    def test_sm90_kernel_backed_mixed_query_mask_block_128(self):
+        if torch.cuda.get_device_capability() != (9, 0):
+            self.skipTest("block_size=128 is specific to the SM90 BF16 kernel")
+        self._assert_kernel_backed_mixed_query_mask(block_size=128)
 
     def test_sm100_kernel_backed_mixed_query_mask(self):
         if torch.cuda.get_device_capability() != (10, 0):

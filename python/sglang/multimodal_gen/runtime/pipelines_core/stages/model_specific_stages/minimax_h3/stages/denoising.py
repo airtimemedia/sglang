@@ -817,7 +817,12 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             emb["text_token_tags"].view(-1).to(torch.long)
         )
         video_query_indices = None
+        subblock_query_block_size = None
         if subblock_enabled:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (
+                SubBlockSparseSchedule,
+            )
+
             text_video_token_mask = emb.get("text_video_token_mask")
             # Legacy/precomputed presentations may lack this optional
             # provenance. The helper then keeps their Qwen rows dense while
@@ -825,6 +830,10 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             video_query_indices = _minimax_h3_subblock_video_query_indices(
                 packed,
                 text_video_token_mask,
+            )
+            # The query-block mask must be cut in the backend's own block width.
+            subblock_query_block_size = (
+                SubBlockSparseSchedule.from_server_args().block_size
             )
 
         sampling = batch.sampling_params
@@ -886,6 +895,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 text_embeddings=emb["hidden_states"],
                 token_tags=tags,
                 video_query_indices=video_query_indices,
+                subblock_query_block_size=subblock_query_block_size,
                 device=device,
             )
             _precompute_refined_prompt_embeds(

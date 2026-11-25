@@ -60,8 +60,11 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-# Query blocks and heads are fixed; Hopper Sage FP8 widens K blocks to 128.
+# Default Q/K block; Hopper Sage FP8 widens K blocks to 128.
 SUBBLOCK_SPARSE_BLOCK_SIZE = 64
+# 128 is the SM90 BF16 CuTe kernel's native tile at head_dim 128; FlashInfer's
+# blk64 kernels (SM100/SM120) and the Sage paths only take 64-row Q blocks.
+SUBBLOCK_SPARSE_BLOCK_SIZES = (64, 128)
 SUBBLOCK_SPARSE_HEAD_DIM = 128
 SAGE_FP8_SM90_KEY_BLOCK_SIZE = 128
 
@@ -157,6 +160,7 @@ def _sm90_sparse_attention(
     topk: int,
     softmax_scale: float,
     block_counts: torch.Tensor | None = None,
+    block_size: int = SUBBLOCK_SPARSE_BLOCK_SIZE,
 ) -> torch.Tensor:
     """Run a SubBlock routing plan through the existing SM90 CuTe kernel."""
     BlockSparseTensorsTorch, flash_attn_func = _load_sm90_block_sparse_attention()
@@ -180,7 +184,7 @@ def _sm90_sparse_attention(
         # cannot share a compiled kernel.
         full_block_cnt=None,
         full_block_idx=None,
-        block_size=(SUBBLOCK_SPARSE_BLOCK_SIZE, SUBBLOCK_SPARSE_BLOCK_SIZE),
+        block_size=(block_size, block_size),
     )
     out, _ = flash_attn_func(
         q,
@@ -349,15 +353,33 @@ def _run_subblock_sparse_attention(
     softmax_scale: float,
     block_counts: torch.Tensor | None = None,
     compute_mode: str = DEFAULT_COMPUTE_MODE,
+    block_size: int = SUBBLOCK_SPARSE_BLOCK_SIZE,
 ) -> torch.Tensor:
     """Dispatch a prepared routing plan to Hopper or Blackwell.
 
     SM90 requires every active index prefix to be sorted in ascending order;
     SM100 and SM120 accept the router's original order. Heterogeneous callers
     must sort compact sparse prefixes before expanding them to full-width dense
-    rows.
+    rows. ``block_size`` is the Q/K block the plan was routed in; only the SM90
+    BF16 kernel serves anything other than 64.
     """
     runner = _get_subblock_sparse_attention_runner(q.device, compute_mode)
+    if block_size == SUBBLOCK_SPARSE_BLOCK_SIZE:
+        return runner(
+            q,
+            k,
+            v,
+            q2k_block_index,
+            topk,
+            softmax_scale,
+            block_counts,
+        )
+    if runner is not _sm90_sparse_attention:
+        raise RuntimeError(
+            f"SubBlock block_size={block_size} is only served by the SM90 BF16 "
+            f"kernel; use block_size={SUBBLOCK_SPARSE_BLOCK_SIZE} on this device "
+            "or compute mode."
+        )
     return runner(
         q,
         k,
@@ -366,6 +388,7 @@ def _run_subblock_sparse_attention(
         topk,
         softmax_scale,
         block_counts,
+        block_size,
     )
 
 
@@ -409,6 +432,9 @@ class SubBlockSparseSchedule(msgspec.Struct, frozen=True):
     n_q: int
     min_seq_len: int
     compute_mode: str
+    # Q/K rows per routed block; n_q / n_k split this, so 128 with n=4 pools
+    # 32-row cells where the default 64 pools 16.
+    block_size: int = SUBBLOCK_SPARSE_BLOCK_SIZE
 
     @classmethod
     def from_server_args(cls) -> SubBlockSparseSchedule:
@@ -432,6 +458,7 @@ class SubBlockSparseSchedule(msgspec.Struct, frozen=True):
             n_q=int(config.get("n_q", DEFAULT_N_Q)),
             min_seq_len=int(config.get("min_seq_len", DEFAULT_MIN_SEQ_LEN)),
             compute_mode=compute_mode,
+            block_size=int(config.get("block_size", SUBBLOCK_SPARSE_BLOCK_SIZE)),
         )
         if not 0.0 <= schedule.sparsity < 1.0:
             raise ValueError(
@@ -446,6 +473,19 @@ class SubBlockSparseSchedule(msgspec.Struct, frozen=True):
             raise ValueError(
                 "subblock compute_mode must be 'bf16' or 'sage_fp8', got "
                 f"{schedule.compute_mode!r}"
+            )
+        if schedule.block_size not in SUBBLOCK_SPARSE_BLOCK_SIZES:
+            raise ValueError(
+                f"subblock block_size must be one of {SUBBLOCK_SPARSE_BLOCK_SIZES}, "
+                f"got {schedule.block_size}"
+            )
+        if (
+            schedule.block_size != SUBBLOCK_SPARSE_BLOCK_SIZE
+            and schedule.compute_mode != "bf16"
+        ):
+            raise ValueError(
+                f"subblock block_size={schedule.block_size} requires "
+                f"compute_mode='bf16', got {schedule.compute_mode!r}"
             )
         return schedule
 
@@ -491,10 +531,11 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
             SubBlockRouter(
                 n_k=self.schedule.n_k,
                 n_q=self.schedule.n_q,
+                block_size_q=self.schedule.block_size,
                 block_size_k=(
                     _sage_key_block_size()
                     if self.schedule.compute_mode == "sage_fp8"
-                    else SUBBLOCK_SPARSE_BLOCK_SIZE
+                    else self.schedule.block_size
                 ),
                 budget_granularity=(
                     1 if self.schedule.compute_mode == "sage_fp8" else 8
@@ -507,6 +548,7 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
         if self.layer_enabled:
             logger.info_once(
                 f"SubBlock sparse attention: sparsity={self.schedule.sparsity:.3f} "
+                f"block_size={self.schedule.block_size} "
                 f"n_k={self.schedule.n_k} n_q={self.schedule.n_q} "
                 f"compute_mode={self.schedule.compute_mode}, dense for the first "
                 f"{self.schedule.skip_first_steps} denoise steps and the first "
@@ -558,9 +600,8 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
         sparse_query_block_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Q ``[1, Sq, H, 128]`` against K/V ``[1, Sk, H, 128]``."""
-        block_pairs = -(-q.shape[1] // SUBBLOCK_SPARSE_BLOCK_SIZE) * -(
-            -k.shape[1] // SUBBLOCK_SPARSE_BLOCK_SIZE
-        )
+        block_size = self.schedule.block_size
+        block_pairs = -(-q.shape[1] // block_size) * -(-k.shape[1] // block_size)
         heads_per_call = max(1, _MAX_ROUTED_BLOCK_PAIRS // block_pairs)
         if q.shape[2] <= heads_per_call:
             return self._sparse_attention_heads(
@@ -591,7 +632,7 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
             sparsity=self.schedule.sparsity,
             softmax_scale=self.softmax_scale,
         )
-        expected_q_blocks = -(-q.shape[1] // SUBBLOCK_SPARSE_BLOCK_SIZE)
+        expected_q_blocks = -(-q.shape[1] // self.schedule.block_size)
         if plan.index.shape[2] != expected_q_blocks:
             raise ValueError(
                 "SubBlock routing/kernel query-block mismatch: "
@@ -664,6 +705,7 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
             self.softmax_scale,
             block_counts,
             self.schedule.compute_mode,
+            self.schedule.block_size,
         )
 
     def forward(

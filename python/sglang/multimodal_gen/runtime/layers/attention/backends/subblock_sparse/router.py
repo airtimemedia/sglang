@@ -192,8 +192,10 @@ class SubBlockRouter:
             Splitting Q *alone* (n_q>1 with n_k=1) is worse than not splitting;
             splitting both sides together is what the defaults do. Costs n_q
             times the score matrix, 0.5% of denoise time.
-        block_size_k: native key-block width. It is 64 for the BF16 kernels and
-            128 for SM90 ``sage_fp8``.
+        block_size_q: native query-block width. It is 64 by default and 128
+            for the SM90 BF16 kernel's Q128 x K128 geometry.
+        block_size_k: native key-block width. It is 64 for the BF16 kernels by
+            default and 128 for SM90 ``sage_fp8`` or Q128 x K128.
         budget_granularity: rounding applied to the selected block count. The
             Q64 x K64 paths retain the established default of 8 (required by
             FlashInfer on SM100/SM120); SM90 ``sage_fp8`` uses 1.
@@ -209,12 +211,18 @@ class SubBlockRouter:
         n_k: int = 4,
         n_q: int = 4,
         *,
+        block_size_q: int = BLOCK,
         block_size_k: int = BLOCK,
         budget_granularity: int = BUDGET_GRANULARITY,
     ) -> None:
         if n_k not in VALID_N or n_q not in VALID_N:
             raise ValueError(
                 f"n_q/n_k must be one of {VALID_N}, got n_q={n_q}, n_k={n_k}"
+            )
+        if block_size_q <= 0 or block_size_q % n_q:
+            raise ValueError(
+                f"query block size {block_size_q} must be positive and divisible "
+                f"by n_q={n_q}"
             )
         if block_size_k <= 0 or block_size_k % n_k:
             raise ValueError(
@@ -226,6 +234,7 @@ class SubBlockRouter:
                 f"budget granularity must be positive, got {budget_granularity}"
             )
         self.n_k, self.n_q = n_k, n_q
+        self.block_size_q = block_size_q
         self.block_size_k = block_size_k
         self.budget_granularity = budget_granularity
 
@@ -250,10 +259,10 @@ class SubBlockRouter:
         """
         b, s, h, d = q.shape
         sk = k.shape[1]
-        gq = -(-s // BLOCK)
+        gq = -(-s // self.block_size_q)
         gk = -(-sk // self.block_size_k)
         nq, nk = self.n_q, self.n_k
-        sub_q = BLOCK // nq
+        sub_q = self.block_size_q // nq
         sub_k = self.block_size_k // nk
 
         # Pooling handles the ragged tail on the *pooled* tensor: padding q/k up to
